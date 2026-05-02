@@ -18,4 +18,4 @@ default = []
 
 [target.'cfg(target_arch = "riscv32")'.dependencies]
 esp32p4 = { version = "0.2", features = ["rt"] }
-bootloader = { package = "esp-p4-bootloader", path = "../esp-p4-bootloader" }
+bootloader = { package = "esp-p4-bootloader", version = "0.1" }
