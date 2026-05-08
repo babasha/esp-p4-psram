@@ -61,6 +61,73 @@ fn main() -> ! {
 }
 ```
 
+## PSRAM-resident code/data (`.psram_text` / `.psram_rodata`)
+
+`psram::copy_sections()` copies two named sections from their load
+address in HP SRAM (where the bootloader put them) into the cached
+PSRAM window at their virtual address, then synchronises L1/L2 cache
+so subsequent data reads and instruction fetches observe the bytes.
+Call it once after `psram::init()` returns Ok.
+
+```rust
+psram::init().expect("psram");
+// SAFETY: single-threaded early-boot, no other code has read the
+// PSRAM VMA window yet.
+unsafe { psram::copy_sections() };
+```
+
+Mark items for PSRAM with `#[link_section = "..."]`:
+
+```rust
+#[link_section = ".psram_rodata"]
+static BIG_LOOKUP_TABLE: [u32; 100_000] = [/* ... */];
+
+#[link_section = ".psram_text"]
+#[inline(never)]
+fn rare_path() { /* ... */ }
+```
+
+Add the matching SECTIONS to your app's `memory.x`. Both sections live
+at VMA in PSRAM and LMA in `REGION_RODATA` (HP SRAM, where the
+bootloader writes the bytes from the app image). Empty sections are
+fine — `copy_sections()` skips them at runtime — but all six symbols
+must exist for the link to succeed.
+
+```text
+MEMORY
+{
+    /* ... your existing RAM / RAM_DMA entries ... */
+
+    /* PSRAM cached window — VMA of .psram_text / .psram_rodata.
+     * Origin and length must match psram::PSRAM_VADDR_BASE/_SIZE. */
+    PSRAM : ORIGIN = 0x48000000, LENGTH = 32M
+}
+
+SECTIONS
+{
+    /* .psram_text — code that lives in PSRAM. AT > REGION_RODATA puts
+     * the LMA in HP SRAM so the bootloader loads the bytes there;
+     * psram::copy_sections() memcpys to VMA at runtime. */
+    .psram_text : ALIGN(4)
+    {
+        __psram_text_start = .;
+        *(.psram_text .psram_text.*)
+        . = ALIGN(4);
+        __psram_text_end = .;
+    } > PSRAM AT > REGION_RODATA
+    __psram_text_lma = LOADADDR(.psram_text);
+
+    .psram_rodata : ALIGN(4)
+    {
+        __psram_rodata_start = .;
+        *(.psram_rodata .psram_rodata.*)
+        . = ALIGN(4);
+        __psram_rodata_end = .;
+    } > PSRAM AT > REGION_RODATA
+    __psram_rodata_lma = LOADADDR(.psram_rodata);
+}
+```
+
 ## What it does, in order
 
 1. **Module clocks**: `set_core_clock_div / enable_core_clock / enable_module_clock /

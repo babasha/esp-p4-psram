@@ -827,6 +827,106 @@ pub fn init() -> Result<ModeRegisters, PsramError> {
     Err(PsramError::NotImplemented)
 }
 
+// ── PSRAM-resident sections (.psram_text / .psram_rodata) ────────────────────
+
+/// Copy `.psram_text` and `.psram_rodata` sections from their load
+/// address (LMA — typically HP SRAM, populated by the bootloader from
+/// the app image) into the cached PSRAM window at their VMA, then
+/// synchronise caches so subsequent data reads and instruction fetches
+/// observe the copied bytes.
+///
+/// Call this AFTER [`init`] returns `Ok`. The linker must define six
+/// symbols (`__psram_text_start`/`_end`/`_lma`, same for `_rodata`).
+/// See the README for a `memory.x` snippet.
+///
+/// Empty sections (start == end) are skipped at runtime, so a project
+/// that uses only `.psram_rodata` (no PSRAM-resident code) pays no
+/// copy cost for `.psram_text` and vice versa — but the symbols still
+/// have to exist or the link will fail.
+///
+/// # Safety
+///
+/// - [`init`] must have completed successfully; otherwise stores into
+///   the PSRAM VMA window have undefined behaviour.
+/// - Must run single-threaded during early app init, before any other
+///   code reads the `.psram_text`/`.psram_rodata` regions.
+#[cfg(target_arch = "riscv32")]
+pub unsafe fn copy_sections() {
+    extern "C" {
+        static mut __psram_text_start: u32;
+        static __psram_text_end: u32;
+        static __psram_text_lma: u32;
+        static mut __psram_rodata_start: u32;
+        static __psram_rodata_end: u32;
+        static __psram_rodata_lma: u32;
+    }
+
+    use core::ptr::{addr_of, addr_of_mut};
+
+    // SAFETY: addresses come from the linker; `ALIGN(4)` in the SECTIONS
+    // clauses guarantees 4-byte alignment of all six symbols, and the
+    // VMA/LMA ranges of the two sections never overlap each other.
+    unsafe {
+        copy_section_words(
+            addr_of_mut!(__psram_text_start),
+            addr_of!(__psram_text_end),
+            addr_of!(__psram_text_lma),
+        );
+        copy_section_words(
+            addr_of_mut!(__psram_rodata_start),
+            addr_of!(__psram_rodata_end),
+            addr_of!(__psram_rodata_lma),
+        );
+        cache_sync_after_section_copy();
+    }
+}
+
+#[cfg(target_arch = "riscv32")]
+#[inline]
+unsafe fn copy_section_words(dst: *mut u32, end: *const u32, src: *const u32) {
+    let len_bytes = (end as usize).saturating_sub(dst as usize);
+    let words = len_bytes / 4;
+    if words == 0 {
+        return;
+    }
+    // SAFETY: caller guarantees alignment and non-overlap; dst and src
+    // ranges are sized identically by construction in the linker.
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, words) };
+}
+
+#[cfg(target_arch = "riscv32")]
+#[inline]
+unsafe fn cache_sync_after_section_copy() {
+    // Stores into 0x48xxxxxx settle in L1 D-cache + L2 (write-back).
+    // Data reads via cache are already coherent — but the L1 I-cache is
+    // a separate cache and must be invalidated so instruction fetches
+    // reload from the freshly-written PSRAM lines. Order:
+    //   1. writeback L1 D + L2 → push our stores to PSRAM
+    //   2. invalidate L1 I (both cores) + L2 → drop any stale lines
+    //   3. fence.i → flush local prefetch buffer
+    const ROM_CACHE_WRITEBACK_ALL: usize = 0x4FC0_0414;
+    const ROM_CACHE_INVALIDATE_ALL: usize = 0x4FC0_0404;
+    const CACHE_MAP_L1_ICACHE_0: u32 = 1 << 0;
+    const CACHE_MAP_L1_ICACHE_1: u32 = 1 << 1;
+    const CACHE_MAP_L1_DCACHE: u32 = 1 << 4;
+    const CACHE_MAP_L2: u32 = 1 << 5;
+    type CacheAll = unsafe extern "C" fn(map: u32) -> i32;
+    // SAFETY: ROM symbol addresses are fixed in P4 ROM (matches the
+    // call sites already in this crate's `cache_invalidate_psram_window`
+    // and the mini-bootloader's `jump_to_entry`).
+    unsafe {
+        let wb: CacheAll = core::mem::transmute(ROM_CACHE_WRITEBACK_ALL);
+        let _ = wb(CACHE_MAP_L1_DCACHE | CACHE_MAP_L2);
+        let inv: CacheAll = core::mem::transmute(ROM_CACHE_INVALIDATE_ALL);
+        let _ = inv(CACHE_MAP_L1_ICACHE_0 | CACHE_MAP_L1_ICACHE_1 | CACHE_MAP_L2);
+        core::arch::asm!("fence.i", options(nomem, nostack));
+    }
+}
+
+/// Host build no-op so workspace tests link.
+#[cfg(not(target_arch = "riscv32"))]
+pub unsafe fn copy_sections() {}
+
 // ── Host tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
